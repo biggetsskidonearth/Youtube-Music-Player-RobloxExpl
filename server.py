@@ -9,16 +9,15 @@ try:
     import websockets
     from websockets.exceptions import ConnectionClosed, ConnectionClosedError
 except ImportError:
-    print("FATAL: 'websockets' not installed. Run: pip install websockets")
+    print("FATAL: 'websockets' not installed.")
     exit(1)
 
 try:
     import yt_dlp
 except ImportError:
-    print("FATAL: 'yt-dlp' not installed. Run: pip install yt-dlp")
+    print("FATAL: 'yt-dlp' not installed.")
     exit(1)
 
-# --- Configuration (Railway / Docker friendly) ---
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", 8765))
 AUDIO_CACHE_DIR = os.getenv("AUDIO_CACHE_DIR", "cache")
@@ -44,17 +43,6 @@ class PlayerState:
 state = PlayerState()
 connected_clients = set()
 loop = None
-
-def get_duration(file_path):
-    try:
-        flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
-        result = subprocess.run(
-            ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', file_path],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, creationflags=flags
-        )
-        return float(result.stdout.strip())
-    except:
-        return 0.0
 
 def search_youtube(query):
     print(f"[SEARCH] Query: {query}")
@@ -91,25 +79,30 @@ def play_audio(file_path):
         cmd = ['ffplay', '-nodisp', '-autoexit', '-loglevel', 'quiet', '-vn', '-ss', str(state.pause_time), '-af', f'volume={vol}', file_path]
         
         flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
-        state.process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=flags)
-        state.is_playing = True
-        state.is_paused = False
-        state.start_time = time.time() - state.pause_time
-        state.pause_time = 0
+        try:
+            state.process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=flags)
+            state.is_playing = True
+            state.is_paused = False
+            state.start_time = time.time() - state.pause_time
+            state.pause_time = 0
+        except Exception as e:
+            print(f"[WARN] Could not start ffplay (Expected on headless servers like Railway): {e}")
+            state.is_playing = False
 
     def monitor():
-        state.process.wait()
-        with state.lock:
-            if state.is_playing and not state.is_paused:
-                state.is_playing = False
-                state.pause_time = 0
-                print("[EVENT] Song ended.")
-                if state.current_index < len(state.queue) - 1:
-                    state.current_index += 1
-                    next_track = state.queue[state.current_index]
-                    asyncio.run_coroutine_threadsafe(handle_play(next_track['id'], next_track.get('title'), next_track.get('artist'), next_track.get('duration')), loop)
-                else:
-                    asyncio.run_coroutine_threadsafe(broadcast_event('ended', {}), loop)
+        if state.process:
+            state.process.wait()
+            with state.lock:
+                if state.is_playing and not state.is_paused:
+                    state.is_playing = False
+                    state.pause_time = 0
+                    print("[EVENT] Song ended.")
+                    if state.current_index < len(state.queue) - 1:
+                        state.current_index += 1
+                        next_track = state.queue[state.current_index]
+                        asyncio.run_coroutine_threadsafe(handle_play(next_track['id'], next_track.get('title'), next_track.get('artist'), next_track.get('duration')), loop)
+                    else:
+                        asyncio.run_coroutine_threadsafe(broadcast_event('ended', {}), loop)
 
     threading.Thread(target=monitor, daemon=True).start()
 
@@ -174,7 +167,7 @@ async def send_state(ws):
     await ws.send(json.dumps(state_msg))
 
 async def handle_play(video_id, title=None, artist=None, duration=0):
-    await broadcast_event('loading', {'title': title or 'Loading...'})
+    await broadcast_event('loading', {'title': title or ''})
     curr_loop = asyncio.get_running_loop()
     file_path, t, a, d = await curr_loop.run_in_executor(None, extract_audio, video_id)
     
@@ -186,7 +179,7 @@ async def handle_play(video_id, title=None, artist=None, duration=0):
             state.duration = d or duration
         play_audio(file_path)
     else:
-        await broadcast_event('error', {'message': 'Failed to extract audio.'})
+        await broadcast_event('error', {'message': ''})
 
 async def handler(websocket):
     connected_clients.add(websocket)
@@ -229,7 +222,7 @@ async def handler(websocket):
                         await handle_play(t['id'], t['title'], t['artist'], t['duration'])
                 elif action == "seek":
                     with state.lock:
-                        if state.process and state.process.poll() is None:
+                        if state.current_url:
                             seek_time = payload.get("time", 0)
                             stop_audio()
                             state.pause_time = seek_time
