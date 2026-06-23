@@ -1,3 +1,2 @@
 websockets
 yt-dlp
-ffmpeg
