@@ -1,0 +1,3 @@
+websockets
+yt-dlp
+ffmpeg
