@@ -1,254 +1,266 @@
---[[
-    Advanced YT Player V4 - Bulletproof WebSocket Client
-    No more connect/disconnect loops.
-]]
+import asyncio
+import json
+import subprocess
+import threading
+import time
+import os
 
-local HttpService = game:GetService("HttpService")
-local Players = game:GetService("Players")
-local UserInputService = game:GetService("UserInputService")
-local TweenService = game:GetService("TweenService")
-local RunService = game:GetService("RunService")
+try:
+    import websockets
+    from websockets.exceptions import ConnectionClosed, ConnectionClosedError
+except ImportError:
+    print("FATAL: 'websockets' not installed. Run: pip install websockets")
+    exit(1)
 
-local Player = Players.LocalPlayer
-local PlayerGui = Player:WaitForChild("PlayerGui")
+try:
+    import yt_dlp
+except ImportError:
+    print("FATAL: 'yt-dlp' not installed. Run: pip install yt-dlp")
+    exit(1)
 
--- CHANGE THIS TO YOUR RAILWAY URL IF HOSTED ONLINE
--- Example: "wss://your-app-name.up.railway.app"
-local WS_URL = "ws://localhost:8765" 
+# --- Configuration (Railway / Docker friendly) ---
+HOST = os.getenv("HOST", "0.0.0.0")
+PORT = int(os.getenv("PORT", 8765))
+AUDIO_CACHE_DIR = os.getenv("AUDIO_CACHE_DIR", "cache")
 
-local Socket = nil
-local WSConnected = false
+os.makedirs(AUDIO_CACHE_DIR, exist_ok=True)
 
-local Theme = {
-    BgDark = Color3.fromRGB(10, 10, 12), BgMain = Color3.fromRGB(18, 18, 22),
-    BgSurface = Color3.fromRGB(26, 26, 32), BgHover = Color3.fromRGB(36, 36, 44),
-    Accent = Color3.fromRGB(30, 215, 96), TextMain = Color3.fromRGB(255, 255, 255),
-    TextSub = Color3.fromRGB(180, 180, 190), TextMuted = Color3.fromRGB(100, 100, 110),
-    Error = Color3.fromRGB(255, 70, 70)
-}
+class PlayerState:
+    def __init__(self):
+        self.process = None
+        self.is_playing = False
+        self.is_paused = False
+        self.current_url = None
+        self.current_title = ""
+        self.current_artist = ""
+        self.duration = 0
+        self.start_time = 0
+        self.pause_time = 0
+        self.volume = 0.5
+        self.queue = []
+        self.current_index = -1
+        self.lock = threading.Lock()
 
-local State = { isPlaying = false, isPaused = false, title = "", artist = "", duration = 0, currentTime = 0, volume = 0.5, queue = {}, currentIndex = -1, isSearching = false }
+state = PlayerState()
+connected_clients = set()
+loop = None
 
--- UI Helpers
-local function new(c, p, par) local i = Instance.new(c) for k,v in pairs(p or {}) do if k~="Parent" then i[k]=v end end if par then i.Parent=par end return i end
-local function addCorner(i, r) return new("UICorner",{CornerRadius=UDim.new(0,r or 8)},i) end
-local function addStroke(i, c, t) return new("UIStroke",{Color=c or Color3.fromRGB(40,40,50),Thickness=t or 1,Transparency=0.5},i) end
-local function tw(i, p, d) TweenService:Create(i, TweenInfo.new(d or 0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), p):Play() end
-local function fmt(s) if not s or s<=0 then return "0:00" end s=math.floor(s) return string.format("%d:%02d", math.floor(s/60), s%60) end
+def get_duration(file_path):
+    try:
+        flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+        result = subprocess.run(
+            ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', file_path],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, creationflags=flags
+        )
+        return float(result.stdout.strip())
+    except:
+        return 0.0
 
--- Main GUI
-local ScreenGui = new("ScreenGui", {Name="YTPlayerV4", ResetOnSpawn=false, ZIndexBehavior=Enum.ZIndexBehavior.Sibling, DisplayOrder=999}, PlayerGui)
-local BlurFrame = new("Frame", {Size=UDim2.new(0,480,0,620), Position=UDim2.new(0.5,-240,0.5,-310), BackgroundColor3=Theme.BgDark, BackgroundTransparency=0.05, BorderSizePixel=0}, ScreenGui)
-addCorner(BlurFrame, 20)
-local MainFrame = new("Frame", {Size=UDim2.new(1,-2,1,-2), Position=UDim2.new(0,1,0,1), BackgroundColor3=Theme.BgMain, BorderSizePixel=0, ClipsDescendants=true}, BlurFrame)
-addCorner(MainFrame, 19)
-local StatusBar = new("Frame", {Size=UDim2.new(1,0,0,4), BackgroundColor3=Theme.Error, BorderSizePixel=0}, MainFrame)
+def search_youtube(query):
+    print(f"[SEARCH] Query: {query}")
+    ydl_opts = {'quiet': True, 'no_warnings': True, 'extract_flat': 'in_playlist', 'default_search': 'ytsearch15', 'forcejson': True}
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"ytsearch15:{query}", download=False)
+            return [{'id': e.get('id'), 'title': e.get('title', 'Unknown'), 'artist': e.get('uploader', 'Unknown'), 'duration': e.get('duration', 0), 'url': f"https://www.youtube.com/watch?v={e.get('id')}"} for e in info.get('entries', []) if e]
+    except Exception as e:
+        print(f"[ERROR] Search failed: {e}")
+        return []
 
--- Header
-local Header = new("Frame", {Size=UDim2.new(1,0,0,60), BackgroundColor3=Theme.BgMain, BorderSizePixel=0}, MainFrame)
-new("TextLabel", {Text="●", Size=UDim2.new(0,20,0,20), Position=UDim2.new(0,20,0,20), BackgroundTransparency=1, TextColor3=Theme.Accent, TextSize=24, Font=Enum.Font.GothamBold}, Header)
-new("TextLabel", {Text="YT Player V4", Size=UDim2.new(0,120,0,20), Position=UDim2.new(0,42,0,20), BackgroundTransparency=1, TextColor3=Theme.TextMain, TextSize=18, Font=Enum.Font.GothamBold, TextXAlignment=Enum.TextXAlignment.Left}, Header)
-local WsStatus = new("TextLabel", {Text="OFFLINE", Size=UDim2.new(0,60,0,16), Position=UDim2.new(0,42,0,40), BackgroundTransparency=1, TextColor3=Theme.Error, TextSize=10, Font=Enum.Font.GothamBold, TextXAlignment=Enum.TextXAlignment.Left}, Header)
+def extract_audio(video_id):
+    print(f"[EXTRACT] ID: {video_id}")
+    ydl_opts = {
+        'format': 'bestaudio/best',
+        'outtmpl': f'{AUDIO_CACHE_DIR}/%(id)s.%(ext)s',
+        'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}],
+        'quiet': True, 'no_warnings': True,
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=True)
+            return f"{AUDIO_CACHE_DIR}/{video_id}.mp3", info.get('title', 'Unknown'), info.get('uploader', 'Unknown'), info.get('duration', 0)
+    except Exception as e:
+        print(f"[ERROR] Extraction failed: {e}")
+        return None, None, None, 0
 
--- Reconnect Button (Prevents auto-loop crashes)
-local ReconnectBtn = new("TextButton", {Text="Reconnect", Size=UDim2.new(0,80,0,24), Position=UDim2.new(1,-180,0,18), BackgroundColor3=Theme.BgSurface, TextColor3=Theme.TextSub, TextSize=10, Font=Enum.Font.GothamBold, BorderSizePixel=0}, Header)
-addCorner(ReconnectBtn, 6)
-ReconnectBtn.MouseButton1Click:Connect(function()
-    if not WSConnected then ConnectWS() end
-end)
-
--- Window Controls
-local function makeWinBtn(t, x, c, cb) local b=new("TextButton",{Text=t,Size=UDim2.new(0,14,0,14),Position=UDim2.new(1,x,0,23),BackgroundColor3=c,TextColor3=Color3.new(1,1,1),TextSize=8,Font=Enum.Font.GothamBold,BorderSizePixel=0},Header) addCorner(b,7) b.MouseButton1Click:Connect(cb) end
-makeWinBtn("_", -50, Color3.fromRGB(255,200,50), function() local m=MainFrame.Size.Y.Offset<100 tw(MainFrame, m and {Size=UDim2.new(1,-2,1,-2)} or {Size=UDim2.new(1,-2,0,60)}, 0.4, Enum.EasingStyle.Back) end)
-makeWinBtn("x", -30, Theme.Error, function() tw(BlurFrame, {Size=UDim2.new(0,480,0,0)}, 0.3) delay(0.3, function() ScreenGui:Destroy() end) end)
-
--- Drag
-local drag={a=false,i=nil,s=Vector3.new(0,0,0),p=UDim2.new()}
-Header.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then drag.a=true drag.i=i drag.s=i.Position drag.p=BlurFrame.Position end end)
-Header.InputEnded:Connect(function(i) if i==drag.i then drag.a=false end end)
-UserInputService.InputChanged:Connect(function(i) if drag.a and i.UserInputType==Enum.UserInputType.MouseMovement then BlurFrame.Position=UDim2.new(drag.p.X.Scale,drag.p.X.Offset+(i.Position-drag.s).X,drag.p.Y.Scale,drag.p.Y.Offset+(i.Position-drag.s).Y) end end)
-
--- Search
-local SearchPanel = new("Frame", {Size=UDim2.new(1,-40,0,44), Position=UDim2.new(0,20,0,72), BackgroundColor3=Theme.BgSurface, BorderSizePixel=0}, MainFrame)
-addCorner(SearchPanel, 12) addStroke(SearchPanel)
-new("TextLabel", {Text="⌕", Size=UDim2.new(0,40,1,0), BackgroundTransparency=1, TextColor3=Theme.TextMuted, TextSize=22, Font=Enum.Font.GothamBold}, SearchPanel)
-local SearchBox = new("TextBox", {PlaceholderText="Search YouTube Music...", Text="", Size=UDim2.new(1,-90,1,0), Position=UDim2.new(0,40,0,0), BackgroundTransparency=1, TextColor3=Theme.TextMain, PlaceholderColor3=Theme.TextMuted, TextSize=14, Font=Enum.Font.Gotham, TextXAlignment=Enum.TextXAlignment.Left, ClearTextOnFocus=false}, SearchPanel)
-local SearchBtn = new("TextButton", {Text="→", Size=UDim2.new(0,44,0,32), Position=UDim2.new(1,-48,0.5,-16), BackgroundColor3=Theme.Accent, TextColor3=Color3.new(1,1,1), TextSize=16, Font=Enum.Font.GothamBold, BorderSizePixel=0}, SearchPanel)
-addCorner(SearchBtn, 8)
-
--- Results
-local ResultsScroll = new("ScrollingFrame", {Size=UDim2.new(1,-40,0,280), Position=UDim2.new(0,20,0,124), BackgroundTransparency=1, ScrollBarThickness=3, ScrollBarImageColor3=Theme.BgHover, BorderSizePixel=0, CanvasSize=UDim2.new(0,0,0,0), AutomaticCanvasSize=Enum.AutomaticSize.Y}, MainFrame)
-new("UIListLayout", {SortOrder=Enum.SortOrder.LayoutOrder, Padding=UDim.new(0,6)}, ResultsScroll)
-
--- Now Playing
-local NPPanel = new("Frame", {Size=UDim2.new(1,0,0,200), Position=UDim2.new(0,0,1,-200), BackgroundColor3=Theme.BgDark, BorderSizePixel=0}, MainFrame)
-local ProgressBack = new("Frame", {Size=UDim2.new(1,0,0,6), Position=UDim2.new(0,0,0,0), BackgroundColor3=Theme.BgHover, BorderSizePixel=0}, NPPanel)
-local ProgressFill = new("Frame", {Size=UDim2.new(0,0,1,0), BackgroundColor3=Theme.Accent, BorderSizePixel=0}, ProgressBack)
-addCorner(ProgressFill, 3)
-local TimeL = new("TextLabel", {Text="0:00", Size=UDim2.new(0,40,0,16), Position=UDim2.new(0,20,0,10), BackgroundTransparency=1, TextColor3=Theme.TextMuted, TextSize=11, Font=Enum.Font.GothamMedium, TextXAlignment=Enum.TextXAlignment.Left}, NPPanel)
-local TimeR = new("TextLabel", {Text="0:00", Size=UDim2.new(0,40,0,16), Position=UDim2.new(1,-60,0,10), BackgroundTransparency=1, TextColor3=Theme.TextMuted, TextSize=11, Font=Enum.Font.GothamMedium, TextXAlignment=Enum.TextXAlignment.Right}, NPPanel)
-local TrackTitle = new("TextLabel", {Text="Nothing Playing", Size=UDim2.new(0.6,0,0,22), Position=UDim2.new(0,20,0,30), BackgroundTransparency=1, TextColor3=Theme.TextMain, TextSize=16, Font=Enum.Font.GothamBold, TextXAlignment=Enum.TextXAlignment.Left, TextTruncate=Enum.TextTruncate.AtEnd}, NPPanel)
-local TrackArtist = new("TextLabel", {Text="Press Reconnect to start", Size=UDim2.new(0.6,0,0,16), Position=UDim2.new(0,20,0,52), BackgroundTransparency=1, TextColor3=Theme.TextSub, TextSize=12, Font=Enum.Font.Gotham, TextXAlignment=Enum.TextXAlignment.Left, TextTruncate=Enum.TextTruncate.AtEnd}, NPPanel)
-
--- Controls
-local Controls = new("Frame", {Size=UDim2.new(1,0,0,50), Position=UDim2.new(0,0,1,-80), BackgroundTransparency=1}, NPPanel)
-local function makeCtrl(t, x, s, cb) local b=new("TextButton",{Text=t,Size=UDim2.new(0,s or 40,0,40),Position=UDim2.new(0.5,x,0.5,-20),BackgroundTransparency=1,TextColor3=Theme.TextSub,TextSize=(s or 40)>40 and 14 or 18,Font=Enum.Font.GothamBold},Controls) b.MouseEnter:Connect(function() tw(b,{TextColor3=Theme.TextMain}) end) b.MouseLeave:Connect(function() tw(b,{TextColor3=Theme.TextSub}) end) b.MouseButton1Click:Connect(cb) return b end
-makeCtrl("⏮",-90,40,function() wsSend({action="prev"}) end)
-local BtnPlay = makeCtrl("▶",-40,50,function() if State.isPlaying then wsSend({action="pause"}) else wsSend({action="resume"}) end end)
-makeCtrl("⏭",10,40,function() wsSend({action="next"}) end)
-makeCtrl("🗑",60,30,function() wsSend({action="clear_queue"}) end)
-
--- Volume
-local VolCont = new("Frame", {Size=UDim2.new(0,120,0,40), Position=UDim2.new(1,-140,1,-80), BackgroundTransparency=1}, NPPanel)
-local VolIcon = new("TextLabel", {Text="🔊", Size=UDim2.new(0,24,0,24), Position=UDim2.new(0,0,0.5,-12), BackgroundTransparency=1, TextSize=16}, VolCont)
-local VolBg = new("Frame", {Size=UDim2.new(0,80,0,4), Position=UDim2.new(0,30,0.5,-2), BackgroundColor3=Theme.BgHover, BorderSizePixel=0}, VolCont)
-addCorner(VolBg, 2)
-local VolFill = new("Frame", {Size=UDim2.new(State.volume,0,1,0), BackgroundColor3=Theme.TextMain, BorderSizePixel=0}, VolBg)
-addCorner(VolFill, 2)
-local volDrag = false
-VolBg.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then volDrag=true updateVol(i) end end)
-VolBg.InputEnded:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then volDrag=false end end)
-UserInputService.InputChanged:Connect(function(i) if volDrag and i.UserInputType==Enum.UserInputType.MouseMovement then updateVol(i) end end)
-function updateVol(i) local r=math.clamp((i.Position.X-VolBg.AbsolutePosition.X)/VolBg.AbsoluteSize.X,0,1) State.volume=r VolFill.Size=UDim2.new(r,0,1,0) VolIcon.Text=r==0 and "🔇" or (r<0.5 and "🔉" or "🔊") wsSend({action="volume",data={volume=r}}) end
-
--- Seek
-local seekDrag = false
-ProgressBack.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then seekDrag=true doSeek(i) end end)
-ProgressBack.InputEnded:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then seekDrag=false end end)
-function doSeek(i) local r=math.clamp((i.Position.X-ProgressBack.AbsolutePosition.X)/ProgressBack.AbsoluteSize.X,0,1) ProgressFill.Size=UDim2.new(r,0,1,0) wsSend({action="seek",data={time=r*State.duration}}) end
-
--- Core WebSocket Logic
-function wsSend(data)
-    if not WSConnected or not Socket then return false end
-    local success, err = pcall(function() Socket:Send(HttpService:JSONEncode(data)) end)
-    if not success then WSConnected = false UpdateUIOffline() end
-    return success
-end
-
-function UpdateUIOffline()
-    WSConnected = false
-    StatusBar.BackgroundColor3 = Theme.Error
-    WsStatus.Text = "OFFLINE"
-    WsStatus.TextColor3 = Theme.Error
-end
-
-function ConnectWS()
-    if WSConnected then return end
-    TrackArtist.Text = "Connecting to server..."
-    local success, err = pcall(function()
-        Socket = WebSocket.connect(WS_URL)
-        WSConnected = true
-        StatusBar.BackgroundColor3 = Theme.Accent
-        WsStatus.Text = "ONLINE"
-        WsStatus.TextColor3 = Theme.Accent
-        TrackArtist.Text = "Connected! Search to begin."
+def play_audio(file_path):
+    with state.lock:
+        stop_audio()
+        print(f"[PLAY] Starting: {file_path}")
+        vol = max(0.01, state.volume * 2)
+        cmd = ['ffplay', '-nodisp', '-autoexit', '-loglevel', 'quiet', '-vn', '-ss', str(state.pause_time), '-af', f'volume={vol}', file_path]
         
-        -- Single listener thread, no loops, no auto-reconnect spam
-        spawn(function()
-            while WSConnected do
-                local recvOk, msg = pcall(function() return Socket:Receive() end)
-                if not recvOk or not msg then
-                    UpdateUIOffline()
-                    break -- Clean break, stops the thread entirely
-                end
-                
-                local decodeOk, data = pcall(function() return HttpService:JSONDecode(msg) end)
-                if decodeOk and data then
-                    -- TRUE REAL-TIME SYNC: Server pushes exact time
-                    if data.type == "sync" then
-                        local d = data.data
-                        State.isPlaying = d.is_playing
-                        State.isPaused = d.is_paused
-                        State.title = d.title or ""
-                        State.artist = d.artist or ""
-                        State.duration = d.duration or 0
-                        State.currentTime = d.current_time or 0
-                        State.queue = d.queue or {}
-                        State.currentIndex = d.current_index or -1
-                        
-                        TrackTitle.Text = State.title ~= "" and State.title or "Nothing Playing"
-                        TrackArtist.Text = State.artist ~= "" and State.artist or ""
-                        BtnPlay.Text = State.isPlaying and "⏸" or "▶"
-                        TimeR.Text = fmt(State.duration)
-                        TimeL.Text = fmt(State.currentTime)
-                        
-                        if State.duration > 0 and not seekDrag then
-                            ProgressFill.Size = UDim2.new(math.clamp(State.currentTime / State.duration, 0, 1), 0, 1, 0)
-                        end
-                    elseif data.type == "event" then
-                        if data.event == "loading" then
-                            TrackTitle.Text = data.data.title or "Loading..."
-                            TrackArtist.Text = "Extracting audio via Python..."
-                            BtnPlay.Text = "⏳"
-                        elseif data.event == "ended" then
-                            BtnPlay.Text = "▶"
-                        elseif data.event == "error" then
-                            TrackArtist.Text = "ERROR: " .. (data.data.message or "Unknown")
-                            BtnPlay.Text = "▶"
-                        end
-                    elseif data.type == "search_results" then
-                        populateResults(data.data)
-                        State.isSearching = false
-                    end
-                end
-            end
-        end)
-    end)
+        flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+        state.process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=flags)
+        state.is_playing = True
+        state.is_paused = False
+        state.start_time = time.time() - state.pause_time
+        state.pause_time = 0
+
+    def monitor():
+        state.process.wait()
+        with state.lock:
+            if state.is_playing and not state.is_paused:
+                state.is_playing = False
+                state.pause_time = 0
+                print("[EVENT] Song ended.")
+                if state.current_index < len(state.queue) - 1:
+                    state.current_index += 1
+                    next_track = state.queue[state.current_index]
+                    asyncio.run_coroutine_threadsafe(handle_play(next_track['id'], next_track.get('title'), next_track.get('artist'), next_track.get('duration')), loop)
+                else:
+                    asyncio.run_coroutine_threadsafe(broadcast_event('ended', {}), loop)
+
+    threading.Thread(target=monitor, daemon=True).start()
+
+def stop_audio():
+    if state.process and state.process.poll() is None:
+        try:
+            state.process.stdin.write(b'q')
+            state.process.stdin.flush()
+            state.process.terminate()
+        except: pass
+    state.process = None
+    state.is_playing = False
+    state.is_paused = False
+    state.pause_time = 0
+
+def pause_audio():
+    with state.lock:
+        if state.process and state.process.poll() is None and not state.is_paused:
+            state.pause_time = time.time() - state.start_time
+            state.process.stdin.write(b'p')
+            state.process.stdin.flush()
+            state.is_paused = True
+            state.is_playing = False
+
+def resume_audio():
+    with state.lock:
+        if state.process and state.process.poll() is None and state.is_paused:
+            state.process.stdin.write(b'p')
+            state.process.stdin.flush()
+            state.is_playing = True
+            state.is_paused = False
+            state.start_time = time.time() - state.pause_time
+
+async def broadcast_event(event_type, data):
+    msg = json.dumps({"type": "event", "event": event_type, "data": data})
+    dead = []
+    for ws in connected_clients:
+        try: await ws.send(msg)
+        except: dead.append(ws)
+    for ws in dead: connected_clients.remove(ws)
+
+async def send_state(ws):
+    current_time = 0
+    with state.lock:
+        if state.is_playing: current_time = time.time() - state.start_time
+        elif state.is_paused: current_time = state.pause_time
+        
+        state_msg = {
+            "type": "sync",
+            "data": {
+                "is_playing": state.is_playing,
+                "is_paused": state.is_paused,
+                "title": state.current_title,
+                "artist": state.current_artist,
+                "duration": state.duration,
+                "current_time": current_time,
+                "volume": state.volume,
+                "queue": state.queue,
+                "current_index": state.current_index
+            }
+        }
+    await ws.send(json.dumps(state_msg))
+
+async def handle_play(video_id, title=None, artist=None, duration=0):
+    await broadcast_event('loading', {'title': title or 'Loading...'})
+    curr_loop = asyncio.get_running_loop()
+    file_path, t, a, d = await curr_loop.run_in_executor(None, extract_audio, video_id)
     
-    if not success then
-        warn("[YT Player] Connection failed: ", err)
-        UpdateUIOffline()
-        TrackArtist.Text = "Failed to connect. Check Python server."
-    end
-end
+    if file_path:
+        with state.lock:
+            state.current_url = video_id
+            state.current_title = t or title or "Unknown"
+            state.current_artist = a or artist or "Unknown"
+            state.duration = d or duration
+        play_audio(file_path)
+    else:
+        await broadcast_event('error', {'message': 'Failed to extract audio.'})
 
--- Results UI
-local resultBtns = {}
-function populateResults(results)
-    for _, b in ipairs(resultBtns) do if b.Parent then b:Destroy() end end
-    resultBtns = {}
-    if not results or #results == 0 then
-        table.insert(resultBtns, new("TextLabel", {Text="No results.", Size=UDim2.new(1,0,0,40), BackgroundTransparency=1, TextColor3=Theme.TextMuted, TextSize=14, Font=Enum.Font.GothamMedium, LayoutOrder=999}, ResultsScroll))
-        return
-    end
-    for i, item in ipairs(results) do
-        local btn = new("TextButton", {Size=UDim2.new(1,0,0,64), BackgroundColor3=Theme.BgSurface, Text="", AutoButtonColor=false, BorderSizePixel=0, LayoutOrder=i}, ResultsScroll)
-        addCorner(btn, 10)
-        btn.MouseEnter:Connect(function() tw(btn, {BackgroundColor3=Theme.BgHover}) end)
-        btn.MouseLeave:Connect(function() tw(btn, {BackgroundColor3=Theme.BgSurface}) end)
-        
-        local thumb = new("Frame", {Size=UDim2.new(0,48,0,48), Position=UDim2.new(0,8,0.5,-24), BackgroundColor3=Theme.BgHover, BorderSizePixel=0}, btn)
-        addCorner(thumb, 8)
-        new("TextLabel", {Text="♪", Size=UDim2.new(1,0,1,0), BackgroundTransparency=1, TextColor3=Theme.TextMuted, TextSize=20, Font=Enum.Font.GothamBold}, thumb)
-        
-        if item.duration and item.duration > 0 then
-            local badge = new("Frame", {Size=UDim2.new(0,34,0,16), Position=UDim2.new(0,22,1,-18), BackgroundColor3=Color3.fromRGB(0,0,0), BackgroundTransparency=0.3, BorderSizePixel=0}, thumb)
-            addCorner(badge, 4)
-            new("TextLabel", {Text=fmt(item.duration), Size=UDim2.new(1,0,1,0), BackgroundTransparency=1, TextColor3=Color3.new(1,1,1), TextSize=9, Font=Enum.Font.GothamBold}, badge)
-        end
-        new("TextLabel", {Text=item.title or "Unknown", Size=UDim2.new(1,-72,0,28), Position=UDim2.new(0,64,0,8), BackgroundTransparency=1, TextColor3=Theme.TextMain, TextSize=13, Font=Enum.Font.GothamBold, TextXAlignment=Enum.TextXAlignment.Left, TextTruncate=Enum.TextTruncate.AtEnd}, btn)
-        new("TextLabel", {Text=item.artist or "Unknown", Size=UDim2.new(1,-72,0,18), Position=UDim2.new(0,64,0,36), BackgroundTransparency=1, TextColor3=Theme.TextSub, TextSize=11, Font=Enum.Font.Gotham, TextXAlignment=Enum.TextXAlignment.Left, TextTruncate=Enum.TextTruncate.AtEnd}, btn)
-        
-        btn.MouseButton1Click:Connect(function()
-            wsSend({action="play", data={id=item.id, title=item.title, artist=item.artist, duration=item.duration}})
-        end)
-        table.insert(resultBtns, btn)
-    end
-end
+async def handler(websocket):
+    connected_clients.add(websocket)
+    print(f"[WS] + Client connected. Total: {len(connected_clients)}")
+    try:
+        await send_state(websocket)
+        async for message in websocket:
+            try:
+                msg = json.loads(message)
+                action = msg.get("action")
+                payload = msg.get("data", {})
 
-local function doSearch()
-    local q = SearchBox.Text
-    if #q == 0 or State.isSearching or not WSConnected then return end
-    State.isSearching = true
-    for _, b in ipairs(resultBtns) do if b.Parent then b:Destroy() end end
-    resultBtns = {}
-    table.insert(resultBtns, new("TextLabel", {Text="Searching...", Size=UDim2.new(1,0,0,40), BackgroundTransparency=1, TextColor3=Theme.TextMuted, TextSize=14, Font=Enum.Font.GothamMedium, LayoutOrder=999}, ResultsScroll))
-    wsSend({action="search", data={query=q}})
-end
+                if action == "search":
+                    curr_loop = asyncio.get_running_loop()
+                    results = await curr_loop.run_in_executor(None, search_youtube, payload.get("query", ""))
+                    await websocket.send(json.dumps({"type": "search_results", "data": results}))
 
-SearchBtn.MouseButton1Click:Connect(doSearch)
-SearchBox.FocusLost:Connect(function(enter) if enter then doSearch() end end)
-UserInputService.InputBegan:Connect(function(i, gp) if not gp and i.KeyCode==Enum.KeyCode.RightControl then ScreenGui.Enabled=not ScreenGui.Enabled end end)
+                elif action == "play":
+                    vid = payload.get("id")
+                    if vid:
+                        if not any(q['id'] == vid for q in state.queue):
+                            state.queue.append({'id': vid, 'title': payload.get('title', ''), 'artist': payload.get('artist', ''), 'duration': payload.get('duration', 0)})
+                        state.current_index = next((i for i, q in enumerate(state.queue) if q['id'] == vid), len(state.queue)-1)
+                        await handle_play(vid, payload.get('title'), payload.get('artist'), payload.get('duration'))
 
--- Initial Connection Attempt
-spawn(function() ConnectWS() end)
+                elif action == "pause": pause_audio()
+                elif action == "resume": resume_audio()
+                elif action == "stop":
+                    stop_audio()
+                    await broadcast_event('stopped', {})
+                elif action == "next":
+                    if state.current_index < len(state.queue) - 1:
+                        state.current_index += 1
+                        t = state.queue[state.current_index]
+                        await handle_play(t['id'], t['title'], t['artist'], t['duration'])
+                elif action == "prev":
+                    if state.current_index > 0:
+                        state.current_index -= 1
+                        t = state.queue[state.current_index]
+                        await handle_play(t['id'], t['title'], t['artist'], t['duration'])
+                elif action == "seek":
+                    with state.lock:
+                        if state.process and state.process.poll() is None:
+                            seek_time = payload.get("time", 0)
+                            stop_audio()
+                            state.pause_time = seek_time
+                            play_audio(f"{AUDIO_CACHE_DIR}/{state.current_url}.mp3")
+                elif action == "volume":
+                    state.volume = payload.get("volume", 0.5)
+                elif action == "clear_queue":
+                    stop_audio()
+                    state.queue = []
+                    state.current_index = -1
+                    await broadcast_event('queue_cleared', {})
+            except json.JSONDecodeError:
+                pass
+            except Exception as e:
+                print(f"[ERROR] Msg handling: {e}")
+
+    except (ConnectionClosed, ConnectionClosedError) as e:
+        print(f"[WS] x Client disconnected. Code: {e.code}")
+    except Exception as e:
+        print(f"[WS] ! Client disconnected. Error: {e}")
+    finally:
+        if websocket in connected_clients:
+            connected_clients.remove(websocket)
+        print(f"[WS] - Client removed. Total: {len(connected_clients)}")
+
+async def main():
+    global loop
+    loop = asyncio.get_running_loop()
+    print(f"Starting Industrial YT Player on ws://{HOST}:{PORT}")
+    async with websockets.serve(handler, HOST, PORT, ping_interval=20, ping_timeout=60, close_timeout=5):
+        await asyncio.Future()
+
+if __name__ == "__main__":
+    asyncio.run(main())
